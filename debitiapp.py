@@ -51,7 +51,7 @@ def load_service_account_info():
 
 @st.cache_resource(ttl=600)
 def get_sheet():
-    info = load_service_account_info()
+    info = dict(st.secrets["gcp_service_account"])
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive.file",
