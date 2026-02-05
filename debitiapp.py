@@ -196,7 +196,7 @@ def sidebar_add_form():
 
 # ---------- UI: main pages ----------
 def page_lavagna():
-    st.title("🧾 Lavagna (Aperti)")
+    st.title("Lavagna")
 
     df = sheet_to_df()
     if df.empty:
