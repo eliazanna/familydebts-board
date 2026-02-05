@@ -1,7 +1,7 @@
-# app.py
-# Family Debts Board (Streamlit + Google Sheets backend)
+# debitiapp.py
+# Family Debts Board (Streamlit + Google Sheets backend + Telegram notifications)
 # Requirements:
-#   pip install streamlit pandas gspread google-auth
+#   pip install streamlit pandas gspread google-auth requests
 
 import streamlit as st
 import pandas as pd
@@ -9,100 +9,79 @@ import uuid
 from datetime import datetime, date
 import json
 import gspread
+import requests
 from google.oauth2.service_account import Credentials
-from typing import Optional
 
 st.set_page_config(page_title="Lavagna Debiti Famiglia", page_icon="🧾", layout="wide")
 
 # ---------- CONFIG ----------
-SHEET_NAME = "family_ledger"           # nome del foglio che hai creato
-LOCAL_SA_KEY_PATH = "sa_key.json"      # il file JSON che hai scaricato
+SHEET_NAME = "family_ledger"
 PEOPLE = ["Elia", "Tommy", "Mamma", "Papà", "Alice"]
 CATEGORIES = ["Università", "Salute", "Spesa", "Casa", "Viaggi", "Regali", "Altro"]
 
-# ---------- Google Sheets helpers ----------
-def load_service_account_info():
-    """
-    - Su Streamlit Cloud: usa st.secrets['GCP_SERVICE_ACCOUNT'] (JSON come stringa)
-    - In locale: se non ci sono secrets, usa il file sa_key.json
-    """
-    # Prova prima a leggere dai secrets (Cloud o locale con secrets.toml)
-    try:
-        raw = st.secrets["GCP_SERVICE_ACCOUNT"]
-        # Se è già un dict, lo usiamo così com'è
-        if isinstance(raw, dict):
-            return raw
-        # Altrimenti è una stringa JSON -> la convertiamo in dict
-        return json.loads(raw)
-    except Exception:
-        # Fallback locale: file JSON
-        try:
-            with open(LOCAL_SA_KEY_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except FileNotFoundError:
-            st.error(
-                "Chiave del Service Account non trovata. "
-                "In locale salva il JSON in 'sa_key.json' oppure configura st.secrets['GCP_SERVICE_ACCOUNT']."
-            )
-            st.stop()
-
-
-
-
+# ---------- Google Sheets (Service Account) ----------
 @st.cache_resource(ttl=600)
 def get_sheet():
+    # Usa la config in secrets in formato TOML-table:
+    # [gcp_service_account]
+    # type="service_account" ...
     info = dict(st.secrets["gcp_service_account"])
+
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive.file",
         "https://www.googleapis.com/auth/drive",
     ]
     creds = Credentials.from_service_account_info(info, scopes=scopes)
     client = gspread.authorize(creds)
     sh = client.open(SHEET_NAME)
-    worksheet = sh.sheet1
-    return worksheet
+    return sh.sheet1
+
+
+def sheet_header(ws):
+    return ws.row_values(1)
 
 
 def sheet_to_df():
     ws = get_sheet()
-    data = ws.get_all_records()  # lista di dict (usa header della riga 1)
-    expected = ["id","debtor","creditor","amount_cents","description","category","due_date","status","created_at","paid_at"]
+    data = ws.get_all_records()  # lista di dict (usa header riga 1)
+    expected = [
+        "id", "debtor", "creditor", "amount_cents", "description", "category",
+        "due_date", "status", "created_at", "paid_at", "notified_7d_at"
+    ]
     if not data:
         return pd.DataFrame(columns=expected)
+
     df = pd.DataFrame(data)
     for c in expected:
         if c not in df.columns:
             df[c] = ""
-    # garantiamo l'ordine e tipi coerenti
     df = df[expected].copy()
     return df
 
 
 def append_row_to_sheet(row: dict):
     ws = get_sheet()
-    header = ws.row_values(1)
+    header = sheet_header(ws)
     values = [row.get(h, "") for h in header]
     ws.append_row(values, value_input_option="USER_ENTERED")
 
 
 def find_row_index_by_id(txn_id: str):
     ws = get_sheet()
-    header = ws.row_values(1)
-    if "id" in header:
-        col_idx = header.index("id") + 1
-    else:
+    header = sheet_header(ws)
+    if "id" not in header:
         return None
+    col_idx = header.index("id") + 1
     col_vals = ws.col_values(col_idx)
     for i, v in enumerate(col_vals):
         if v == txn_id:
-            return i + 1  # 1-based
+            return i + 1  # 1-based row index
     return None
 
 
 def update_cells_in_row(row_index: int, updates: dict):
     ws = get_sheet()
-    header = ws.row_values(1)
+    header = sheet_header(ws)
     cells = []
     for col_name, val in updates.items():
         if col_name in header:
@@ -115,6 +94,147 @@ def update_cells_in_row(row_index: int, updates: dict):
 def delete_row(row_index: int):
     ws = get_sheet()
     ws.delete_rows(row_index)
+
+
+# ---------- Telegram ----------
+def get_telegram_token() -> str:
+    # in secrets: TELEGRAM_BOT_TOKEN = "..."
+    return st.secrets.get("TELEGRAM_BOT_TOKEN", "")
+
+
+def get_chat_ids() -> dict:
+    """
+    in secrets:
+    TELEGRAM_CHAT_IDS_JSON = '''{"Elia": 227544639, ...}'''
+    """
+    raw = st.secrets.get("TELEGRAM_CHAT_IDS_JSON", "{}")
+    if isinstance(raw, dict):
+        return raw
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {}
+
+
+def send_telegram_message(bot_token: str, chat_id: int, text: str) -> None:
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    r = requests.post(url, json=payload, timeout=15)
+    r.raise_for_status()
+
+
+def build_due_soon_message(row: dict, days_left: int) -> str:
+    debtor = str(row.get("debtor", "")).strip()
+    creditor = str(row.get("creditor", "")).strip()
+    desc = str(row.get("description", "")).strip()
+    due = str(row.get("due_date", "")).strip()
+    try:
+        amount = int(str(row.get("amount_cents", "0")).strip() or 0) / 100.0
+    except Exception:
+        amount = 0.0
+
+    return (
+        f"⏰ <b>Promemoria debito</b>\n\n"
+        f"Ciao <b>{debtor}</b>!\n"
+        f"Tra <b>{days_left} giorni</b> scade:\n"
+        f"• {desc}\n"
+        f"• Importo: <b>{amount:.2f} €</b>\n"
+        f"• Da pagare a: <b>{creditor}</b>\n"
+        f"• Scadenza: <b>{due}</b>"
+    )
+
+
+def ensure_column_exists(col_name: str):
+    ws = get_sheet()
+    header = sheet_header(ws)
+    if col_name in header:
+        return
+
+    # aggiungo colonna in fondo
+    ws.update_cell(1, len(header) + 1, col_name)
+
+
+def run_due_soon_notifications(days_threshold: int = 7) -> dict:
+    """
+    Invia notifiche Telegram per voci OPEN con due_date entro days_threshold.
+    Non invia se notified_7d_at è già compilato.
+    Aggiorna notified_7d_at nello sheet.
+    """
+    token = get_telegram_token()
+    chat_ids = get_chat_ids()
+
+    if not token:
+        return {"ok": False, "error": "Manca TELEGRAM_BOT_TOKEN nei secrets."}
+    if not chat_ids:
+        return {"ok": False, "error": "Manca TELEGRAM_CHAT_IDS_JSON nei secrets (o è vuoto)."}
+
+    ensure_column_exists("notified_7d_at")
+
+    ws = get_sheet()
+    header = sheet_header(ws)
+    if "notified_7d_at" not in header:
+        return {"ok": False, "error": "Non riesco a creare/vedere la colonna notified_7d_at."}
+
+    # scarico records
+    rows = ws.get_all_records()
+    today = date.today()
+
+    # indice colonna
+    col_notified = header.index("notified_7d_at") + 1
+
+    sent = 0
+    skipped_no_chatid = 0
+    skipped_already = 0
+    skipped_not_due = 0
+
+    for sheet_row_index, row in enumerate(rows, start=2):  # data starts row 2
+        if str(row.get("status", "")).strip() != "OPEN":
+            continue
+
+        due_str = str(row.get("due_date", "")).strip()
+        if not due_str:
+            continue
+
+        already = str(row.get("notified_7d_at", "")).strip()
+        if already:
+            skipped_already += 1
+            continue
+
+        try:
+            due = datetime.strptime(due_str, "%Y-%m-%d").date()
+        except Exception:
+            continue
+
+        days_left = (due - today).days
+        if not (0 <= days_left <= days_threshold):
+            skipped_not_due += 1
+            continue
+
+        debtor = str(row.get("debtor", "")).strip()
+        chat_id = chat_ids.get(debtor)
+        if not chat_id:
+            skipped_no_chatid += 1
+            continue
+
+        msg = build_due_soon_message(row, days_left)
+        send_telegram_message(token, int(chat_id), msg)
+
+        # mark notified
+        ws.update_cell(sheet_row_index, col_notified, datetime.now().isoformat(timespec="seconds"))
+        sent += 1
+
+    return {
+        "ok": True,
+        "sent": sent,
+        "skipped_no_chatid": skipped_no_chatid,
+        "skipped_already": skipped_already,
+        "skipped_not_due": skipped_not_due,
+    }
 
 
 # ---------- small utils ----------
@@ -150,7 +270,7 @@ def person_filter_df(df: pd.DataFrame, person: str) -> pd.DataFrame:
     return df[(df["debtor"] == person) | (df["creditor"] == person)]
 
 
-# ---------- UI: sidebar (add) ----------
+# ---------- UI: sidebar ----------
 def sidebar_add_form():
     st.sidebar.header("➕ Nuova voce")
 
@@ -177,6 +297,8 @@ def sidebar_add_form():
                 st.sidebar.error("Importo non valido.")
                 return
 
+            ensure_column_exists("notified_7d_at")
+
             due_iso = due.isoformat() if due else ""
             txn = {
                 "id": str(uuid.uuid4()),
@@ -188,15 +310,39 @@ def sidebar_add_form():
                 "due_date": due_iso,
                 "status": "OPEN",
                 "created_at": datetime.now().isoformat(timespec="seconds"),
-                "paid_at": ""
+                "paid_at": "",
+                "notified_7d_at": ""
             }
             append_row_to_sheet(txn)
             st.sidebar.success("Aggiunto alla lavagna!")
 
 
+def sidebar_notifications_box():
+    st.sidebar.header("🔔 Notifiche Telegram")
+
+    st.sidebar.caption("Invia promemoria per scadenze entro 7 giorni (manuale per ora).")
+
+    disabled = (not get_telegram_token())
+    if disabled:
+        st.sidebar.warning("Manca TELEGRAM_BOT_TOKEN nei secrets.")
+
+    if st.sidebar.button("📨 Invia notifiche (7 giorni)", use_container_width=True, disabled=disabled):
+        with st.spinner("Invio notifiche in corso..."):
+            res = run_due_soon_notifications(days_threshold=7)
+
+        if not res.get("ok"):
+            st.sidebar.error(res.get("error", "Errore sconosciuto"))
+        else:
+            st.sidebar.success(f"Notifiche inviate: {res['sent']}")
+            if res["skipped_no_chatid"]:
+                st.sidebar.info(f"Senza chat_id: {res['skipped_no_chatid']} (aggiungili poi nei secrets)")
+            if res["skipped_already"]:
+                st.sidebar.info(f"Già notificate: {res['skipped_already']}")
+
+
 # ---------- UI: main pages ----------
 def page_lavagna():
-    st.title("Lavagna")
+    st.title("🧾 Lavagna (Aperti)")
 
     df = sheet_to_df()
     if df.empty:
@@ -206,7 +352,6 @@ def page_lavagna():
     df_open = df[df["status"] == "OPEN"].copy()
     df_open["amount_eur"] = df_open["amount_cents"].apply(lambda x: euros_from_cents(x))
 
-    # KPIs
     col1, col2, col3, col4 = st.columns(4)
     total_open = df_open["amount_eur"].sum() if not df_open.empty else 0
     overdue = 0
@@ -357,8 +502,9 @@ def page_storico():
 
 # ---------- MAIN ----------
 def main():
-    # note: non serve init_db con Google Sheet
     sidebar_add_form()
+    sidebar_notifications_box()
+
     page = st.sidebar.radio("Navigazione", ["Lavagna", "Storico"], index=0)
     if page == "Lavagna":
         page_lavagna()
