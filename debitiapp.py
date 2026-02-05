@@ -98,22 +98,12 @@ def delete_row(row_index: int):
 
 # ---------- Telegram ----------
 def get_telegram_token() -> str:
-    # in secrets: TELEGRAM_BOT_TOKEN = "..."
-    return st.secrets.get("TELEGRAM_BOT_TOKEN", "")
-
+    return st.secrets["telegram"]["bot_token"]
 
 def get_chat_ids() -> dict:
-    """
-    in secrets:
-    TELEGRAM_CHAT_IDS_JSON = '''{"Elia": 227544639, ...}'''
-    """
-    raw = st.secrets.get("TELEGRAM_CHAT_IDS_JSON", "{}")
-    if isinstance(raw, dict):
-        return raw
-    try:
-        return json.loads(raw)
-    except Exception:
-        return {}
+    raw = st.secrets["telegram"]["chat_ids_json"]
+    return json.loads(raw) if isinstance(raw, str) else raw
+
 
 
 def send_telegram_message(bot_token: str, chat_id: int, text: str) -> None:
