@@ -23,33 +23,29 @@ CATEGORIES = ["Università", "Salute", "Spesa", "Casa", "Viaggi", "Regali", "Alt
 # ---------- Google Sheets helpers ----------
 def load_service_account_info():
     """
-    Strategy:
-     - Se stai su Streamlit Cloud: usa st.secrets['GCP_SERVICE_ACCOUNT']
-     - Altrimenti fallback locale al file sa_key.json
+    - Su Streamlit Cloud: usa st.secrets['GCP_SERVICE_ACCOUNT'] (JSON come stringa)
+    - In locale: se non ci sono secrets, usa il file sa_key.json
     """
+    # Prova prima a leggere dai secrets (Cloud o locale con secrets.toml)
     try:
-        if "GCP_SERVICE_ACCOUNT" in st.secrets:
-            raw = st.secrets["GCP_SERVICE_ACCOUNT"]
-            if isinstance(raw, dict):
-                return raw
-            try:
-                return json.loads(raw)
-            except Exception:
-                return raw
+        raw = st.secrets["GCP_SERVICE_ACCOUNT"]
+        # Se è già un dict, lo usiamo così com'è
+        if isinstance(raw, dict):
+            return raw
+        # Altrimenti è una stringa JSON -> la convertiamo in dict
+        return json.loads(raw)
     except Exception:
-        # st.secrets non esiste o non è configurato -> fallback locale
-        pass
+        # Fallback locale: file JSON
+        try:
+            with open(LOCAL_SA_KEY_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except FileNotFoundError:
+            st.error(
+                "Chiave del Service Account non trovata. "
+                "In locale salva il JSON in 'sa_key.json' oppure configura st.secrets['GCP_SERVICE_ACCOUNT']."
+            )
+            st.stop()
 
-    # Local fallback
-    try:
-        with open(LOCAL_SA_KEY_PATH, "r", encoding="utf-8") as f:
-            info = json.load(f)
-        return info
-    except FileNotFoundError:
-        st.error(
-            "Chiave del Service Account non trovata. Per i test locali salva il JSON in 'sa_key.json' o configura st.secrets['GCP_SERVICE_ACCOUNT']."
-        )
-        st.stop()
 
 
 
